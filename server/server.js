@@ -4,21 +4,52 @@ import dotenv from 'dotenv';
 import ratelimit from 'express-rate-limit';
 import helmet from 'helmet';
 import OpenAI from 'openai';
-import sqlite3 from 'sqlite3';
+import { Pool } from 'pg'; // New import for PostgreSQL
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 
 dotenv.config();
 
+// PostgreSQL Pool Setup
+const pool = new Pool({
+  connectionString: process.env.POSTGRES_URL,
+  ssl: { rejectUnauthorized: false }, // Adjust SSL settings as needed for your setup
+});
+
+// Create tables if they don't exist (run this once or on app initialization)
+(async () => {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE,
+        password TEXT
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS explanations (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER,
+        code TEXT NOT NULL,
+        language TEXT,
+        explanation TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+      )
+    `);
+    console.log('✅ Connected to Postgres and tables created');
+  } catch (err) {
+    console.error('Error setting up Postgres:', err.message);
+  } finally {
+    client.release();
+  }
+})();
 
 // Express App Setup
-
 const app = express();
-app.use(cors());
 app.use(express.json({ limit: '10mb' }));
-
 app.use(helmet());
-
 app.use(
   cors({
     origin: process.env.FRONTEND_URL || 'http://localhost:5173',
@@ -34,47 +65,13 @@ const limiter = ratelimit({
 });
 app.use(limiter);
 
-
-// SQLite DB Setup
-
-const db = new sqlite3.Database('./users.db', err => {
-  if (err) console.error('Error connecting to SQLite:', err.message);
-  else console.log('✅ Connected to SQLite database');
-});
-
-// Users table
-db.run(
-  `CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE,
-    password TEXT
-  )`
-);
-
-// Explanations table
-db.run(
-  `CREATE TABLE IF NOT EXISTS explanations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    code TEXT NOT NULL,
-    language TEXT,
-    explanation TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  )`
-);
-
-
 // OpenAI Client Setup
-
 const client = new OpenAI({
   baseURL: 'https://openrouter.ai/api/v1',
   apiKey: process.env.API_KEY,
 });
 
-
 // Middleware: Verify JWT
-
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -87,9 +84,7 @@ function authenticateToken(req, res, next) {
   });
 }
 
-
 // Routes: Auth
-
 
 // Register user
 app.post('/api/register', async (req, res) => {
@@ -101,55 +96,52 @@ app.post('/api/register', async (req, res) => {
 
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
-    db.run(
-      `INSERT INTO users (username, password) VALUES (?, ?)`,
-      [username, hashedPassword],
-      function (err) {
-        if (err) {
-          if (err.message.includes('UNIQUE constraint'))
-            return res.status(400).json({ error: 'Username already exists' });
-          return res.status(500).json({ error: 'Database error' });
-        }
-        res.status(201).json({ message: 'User registered successfully' });
-      }
-    );
+    await pool.query('INSERT INTO users (username, password) VALUES ($1, $2)', [
+      username,
+      hashedPassword,
+    ]);
+    res.status(201).json({ message: 'User registered successfully' });
   } catch (error) {
+    if (error.code === '23505') {
+      // Unique constraint violation
+      return res.status(400).json({ error: 'Username already exists' });
+    }
+    console.error('Database error:', error);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
 // Login user
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password)
     return res.status(400).json({ error: 'Username and password required' });
 
-  db.get(
-    `SELECT * FROM users WHERE username = ?`,
-    [username],
-    async (err, user) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM users WHERE username = $1',
+      [username]
+    );
+    const user = rows[0];
+    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
 
-      const valid = await bcrypt.compare(password, user.password);
-      if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
 
-      const token = jwt.sign(
-        { id: user.id, username: user.username },
-        process.env.JWT_SECRET,
-        {
-          expiresIn: '1h',
-        }
-      );
+    const token = jwt.sign(
+      { id: user.id, username: user.username },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
 
-      res.json({ message: 'Login successful', token });
-    }
-  );
+    res.json({ message: 'Login successful', token });
+  } catch (error) {
+    console.error('Database error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
 });
 
-
 // AI Explain Code Route
-
 app.post('/api/explain-code', authenticateToken, async (req, res) => {
   try {
     const { code, language } = req.body;
@@ -177,12 +169,9 @@ app.post('/api/explain-code', authenticateToken, async (req, res) => {
         .json({ error: 'Failed to get explanation from AI model' });
 
     // Save explanation in DB
-    db.run(
-      `INSERT INTO explanations (user_id, code, language, explanation) VALUES (?, ?, ?, ?)`,
-      [req.user.id, code, language, explanation],
-      function (err) {
-        if (err) console.error('DB save error:', err.message);
-      }
+    await pool.query(
+      'INSERT INTO explanations (user_id, code, language, explanation) VALUES ($1, $2, $3, $4)',
+      [req.user.id, code, language, explanation]
     );
 
     res.json({ explanation, language });
@@ -192,38 +181,37 @@ app.post('/api/explain-code', authenticateToken, async (req, res) => {
   }
 });
 
-
 // Get User's Explanations
-
-app.get('/api/my-explanations', authenticateToken, (req, res) => {
-  db.all(
-    `SELECT * FROM explanations WHERE user_id = ? ORDER BY created_at DESC`,
-    [req.user.id],
-    (err, rows) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json({ explanations: rows });
-    }
-  );
+app.get('/api/my-explanations', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM explanations WHERE user_id = $1 ORDER BY created_at DESC',
+      [req.user.id]
+    );
+    res.json({ explanations: rows });
+  } catch (error) {
+    console.error('Database error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
 });
 
 // Delete Explanation
-app.delete('/api/explanations/:id', authenticateToken, (req, res) => {
+app.delete('/api/explanations/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
-  db.run(
-    `DELETE FROM explanations WHERE id = ? AND user_id = ?`,
-    [id, req.user.id],
-    function (err) {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      if (this.changes === 0) return res.status(404).json({ error: 'Explanation not found or not owned by you' });
-      res.json({ message: 'Explanation deleted successfully' });
-    }
-  );
+  try {
+    const { rowCount } = await pool.query(
+      'DELETE FROM explanations WHERE id = $1 AND user_id = $2',
+      [id, req.user.id]
+    );
+    if (rowCount === 0)
+      return res
+        .status(404)
+        .json({ error: 'Explanation not found or not owned by you' });
+    res.json({ message: 'Explanation deleted successfully' });
+  } catch (error) {
+    console.error('Database error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
 });
 
-
-// Start Server
-
-const port = process.env.PORT || 5000;
-app.listen(port, () => {
-  console.log(`🚀 Server running on http://localhost:${port}`);
-});
+export default app;
